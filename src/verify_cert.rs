@@ -131,17 +131,17 @@ fn build_chain_inner(
             return Err(Error::UnknownIssuer.into());
         }
 
-        let name_constraints = trust_anchor.name_constraints.map(untrusted::Input::from);
-
-        untrusted::read_all_optional(name_constraints, ErrorOrInternalError::Error(Error::BadDer), |value| {
-            name::check_name_constraints(value, cert, budget)
-        })?;
-
         // TODO: check_distrust(trust_anchor_subject, trust_anchor_spki)?;
 
         let trust_anchor_spki = untrusted::Input::from(trust_anchor.spki);
 
         check_signatures(supported_sig_algs, cert, trust_anchor_spki, budget)?;
+
+        check_signed_chain_name_constraints(
+            cert,
+            trust_anchor,
+            budget,
+        )?;
 
         Ok(())
     }) {
@@ -182,10 +182,6 @@ fn build_chain_inner(
             }
         }
 
-        untrusted::read_all_optional(potential_issuer.name_constraints, ErrorOrInternalError::Error(Error::BadDer), |value| {
-            name::check_name_constraints(value, cert, budget)
-        })?;
-
         let next_sub_ca_count = match used_as_ca {
             UsedAsCa::No => sub_ca_count,
             UsedAsCa::Yes => sub_ca_count + 1,
@@ -222,6 +218,36 @@ fn check_signatures(
         match &cert.ee_or_ca {
             EndEntityOrCa::Ca(child_cert) => {
                 spki_value = cert.spki.value();
+                cert = child_cert;
+            }
+            EndEntityOrCa::EndEntity => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_signed_chain_name_constraints(
+    cert_chain: &Cert,
+    trust_anchor: &TrustAnchor,
+    budget: &mut Budget,
+) -> Result<(), ErrorOrInternalError> {
+    let mut cert = cert_chain;
+    let mut name_constraints = trust_anchor
+        .name_constraints
+        .as_ref()
+        .map(|der| untrusted::Input::from(der));
+
+    loop {
+        untrusted::read_all_optional(name_constraints, ErrorOrInternalError::Error(Error::BadDer), |value| {
+            name::check_name_constraints(value, cert, budget)
+        })?;
+
+        match &cert.ee_or_ca {
+            EndEntityOrCa::Ca(child_cert) => {
+                name_constraints = cert.name_constraints;
                 cert = child_cert;
             }
             EndEntityOrCa::EndEntity => {
@@ -506,13 +532,13 @@ mod tests {
         trust_anchor_is_actual_issuer: TrustAnchorIsActualIssuer,
         budget: Option<Budget>,
     ) -> ErrorOrInternalError {
-        let ca_cert = make_issuer("Bogus Subject");
+        let ca_cert = make_issuer("Bogus Subject", None);
         let ca_cert_der = ca_cert.serialize_der().unwrap();
 
         let mut intermediates = Vec::with_capacity(intermediate_count);
         let mut issuer = ca_cert;
         for _ in 0..intermediate_count {
-            let intermediate = make_issuer("Bogus Subject");
+            let intermediate = make_issuer("Bogus Subject", None);
             let intermediate_der = intermediate.serialize_der_with_signer(&issuer).unwrap();
             intermediates.push(intermediate_der);
             issuer = intermediate;
@@ -548,7 +574,79 @@ mod tests {
         ));
     }
 
-    fn make_issuer(org_name: impl Into<String>) -> rcgen::Certificate {
+    #[test]
+    fn name_constraint_budget() {
+        // Issue a trust anchor that imposes name constraints. The constraint should match
+        // the end entity certificate SAN.
+        let ca_cert = make_issuer(
+            "Constrained Root",
+            Some(rcgen::NameConstraints {
+                permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName(".com".into())],
+                excluded_subtrees: vec![],
+            }),
+        );
+        let ca_cert_der = ca_cert.serialize_der().unwrap();
+
+        // Create a series of intermediate issuers. We'll only use one in the actual built path,
+        // helping demonstrate that the name constraint budget is not expended checking certificates
+        // that are not part of the path we compute.
+        const NUM_INTERMEDIATES: usize = 5;
+        let mut intermediates = Vec::with_capacity(NUM_INTERMEDIATES);
+        for i in 0..NUM_INTERMEDIATES {
+            intermediates.push(make_issuer(format!("Intermediate {i}"), None));
+        }
+
+        // Each intermediate should be issued by the trust anchor.
+        let mut intermediates_der = Vec::with_capacity(NUM_INTERMEDIATES);
+        for intermediate in &intermediates {
+            intermediates_der.push(intermediate.serialize_der_with_signer(&ca_cert).unwrap());
+        }
+
+        // Create an end-entity cert that is issued by the last of the intermediates.
+        let ee_cert = make_end_entity(intermediates.last().unwrap());
+
+        // We use a custom budget to make it easier to write a test, otherwise it is tricky to
+        // stuff enough names/constraints into the potential chains while staying within the path
+        // depth limit and the build chain call limit.
+        let passing_budget = Budget {
+            // One comparison against the intermediate's distinguished name.
+            // One comparison against the EE's distinguished name.
+            // One comparison against the EE's SAN.
+            //  = 3 total comparisons.
+            name_constraint_comparisons: 3,
+            ..Budget::default()
+        };
+
+        // Validation should succeed with the name constraint comparison budget allocated above.
+        // This shows that we're not consuming budget on unused intermediates: we didn't budget
+        // enough comparisons for that to pass the overall chain building.
+        let result = verify_chain(
+            &ca_cert_der,
+            &intermediates_der,
+            &ee_cert,
+            Some(passing_budget),
+        );
+        assert!(result.is_ok());
+
+        let failing_budget = Budget {
+            // See passing_budget: 2 comparisons is not sufficient.
+            name_constraint_comparisons: 2,
+            ..Budget::default()
+        };
+        // Validation should fail when the budget is smaller than the number of comparisons performed
+        // on the validated path. This demonstrates we properly fail path building when too many
+        // name constraint comparisons occur.
+        let result = verify_chain(
+            &ca_cert_der,
+            &intermediates_der,
+            &ee_cert,
+            Some(failing_budget),
+        );
+
+        assert!(matches!(result, Err(ErrorOrInternalError::InternalError(InternalError::MaximumNameConstraintComparisonsExceeded))));
+    }
+
+    fn make_issuer(org_name: impl Into<String>, name_constraints: Option<rcgen::NameConstraints>) -> rcgen::Certificate {
         let mut ca_params = rcgen::CertificateParams::new(Vec::new());
         ca_params
             .distinguished_name
@@ -560,6 +658,7 @@ mod tests {
             rcgen::KeyUsagePurpose::CrlSign,
         ];
         ca_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        ca_params.name_constraints = name_constraints;
         rcgen::Certificate::from_params(ca_params).unwrap()
     }
 
