@@ -487,9 +487,6 @@ mod tests {
         trust_anchor_is_actual_issuer: TrustAnchorIsActualIssuer,
         budget: Option<Budget>,
     ) -> ErrorOrInternalError {
-        use crate::ECDSA_P256_SHA256;
-        use crate::{EndEntityCert, Time};
-
         let ca_cert = make_issuer("Bogus Subject");
         let ca_cert_der = ca_cert.serialize_der().unwrap();
 
@@ -502,27 +499,11 @@ mod tests {
             issuer = intermediate;
         }
 
-        let anchors = &[TrustAnchor::try_from_cert_der(&ca_cert_der).unwrap()];
-        let time = Time::from_seconds_since_unix_epoch(0x1fed_f00d);
-        let ee_cert_der = make_end_entity(&issuer);
-        let cert = EndEntityCert::try_from(&ee_cert_der[..]).unwrap();
-        let mut intermediate_certs = intermediates.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
-
         if let TrustAnchorIsActualIssuer::No = trust_anchor_is_actual_issuer {
-            intermediate_certs.pop();
+            intermediates.pop();
         }
 
-        build_chain_inner(
-            EKU_SERVER_AUTH,
-            &[&ECDSA_P256_SHA256],
-            anchors,
-            &intermediate_certs,
-            cert.inner(),
-            time,
-            0,
-            &mut budget.unwrap_or_default(),
-        )
-            .unwrap_err()
+        verify_chain(&ca_cert_der, &intermediates, &make_end_entity(&issuer), budget).unwrap_err()
     }
 
     #[test]
@@ -572,5 +553,34 @@ mod tests {
             .unwrap()
             .serialize_der_with_signer(issuer)
             .unwrap()
+    }
+
+    fn verify_chain(
+        trust_anchor_der: &[u8],
+        intermediates_der: &[Vec<u8>],
+        ee_cert_der: &[u8],
+        budget: Option<Budget>,
+    ) -> Result<(), ErrorOrInternalError> {
+        use crate::ECDSA_P256_SHA256;
+        use crate::{EndEntityCert, Time};
+
+        let anchors = &[TrustAnchor::try_from_cert_der(trust_anchor_der).unwrap()];
+        let time = Time::from_seconds_since_unix_epoch(0x1fed_f00d);
+        let cert = EndEntityCert::try_from(ee_cert_der).unwrap();
+        let intermediates_der = intermediates_der
+            .iter()
+            .map(|x| x.as_ref())
+            .collect::<Vec<_>>();
+
+        build_chain_inner(
+            EKU_SERVER_AUTH,
+            &[&ECDSA_P256_SHA256],
+            anchors,
+            &intermediates_der,
+            cert.inner(),
+            time,
+            0,
+            &mut budget.unwrap_or_default(),
+        )
     }
 }
