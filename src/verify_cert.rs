@@ -490,8 +490,6 @@ mod tests {
         use crate::ECDSA_P256_SHA256;
         use crate::{EndEntityCert, Time};
 
-        let alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-
         let ca_cert = make_issuer("Bogus Subject");
         let ca_cert_der = ca_cert.serialize_der().unwrap();
 
@@ -504,14 +502,9 @@ mod tests {
             issuer = intermediate;
         }
 
-        let mut ee_params = rcgen::CertificateParams::new(vec!["example.com".to_string()]);
-        ee_params.is_ca = rcgen::IsCa::ExplicitNoCa;
-        ee_params.alg = alg;
-        let ee_cert = rcgen::Certificate::from_params(ee_params).unwrap();
-        let ee_cert_der = ee_cert.serialize_der_with_signer(&issuer).unwrap();
-
         let anchors = &[TrustAnchor::try_from_cert_der(&ca_cert_der).unwrap()];
         let time = Time::from_seconds_since_unix_epoch(0x1fed_f00d);
+        let ee_cert_der = make_end_entity(&issuer);
         let cert = EndEntityCert::try_from(&ee_cert_der[..]).unwrap();
         let mut intermediate_certs = intermediates.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
 
@@ -568,5 +561,16 @@ mod tests {
         ];
         ca_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
         rcgen::Certificate::from_params(ca_params).unwrap()
+    }
+
+    fn make_end_entity(issuer: &rcgen::Certificate) -> Vec<u8> {
+        let mut ee_params = rcgen::CertificateParams::new(vec!["example.com".to_string()]);
+        ee_params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        ee_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+
+        rcgen::Certificate::from_params(ee_params)
+            .unwrap()
+            .serialize_der_with_signer(issuer)
+            .unwrap()
     }
 }
