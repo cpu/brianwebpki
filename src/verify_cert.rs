@@ -51,6 +51,8 @@ pub fn build_chain(
 /// for testing).
 enum InternalError {
     MaximumSignatureChecksExceeded,
+    /// The maximum number of internal path building calls has been reached. Path complexity is too great.
+    MaximumPathBuildCallsExceeded,
 }
 
 enum ErrorOrInternalError {
@@ -62,7 +64,8 @@ impl ErrorOrInternalError {
     fn is_fatal(&self) -> bool {
         match self {
             ErrorOrInternalError::Error(_) => false,
-            ErrorOrInternalError::InternalError(InternalError::MaximumSignatureChecksExceeded) => {
+            ErrorOrInternalError::InternalError(InternalError::MaximumSignatureChecksExceeded) |
+            ErrorOrInternalError::InternalError(InternalError::MaximumPathBuildCallsExceeded) => {
                 true
             }
         }
@@ -185,6 +188,7 @@ fn build_chain_inner(
             UsedAsCa::Yes => sub_ca_count + 1,
         };
 
+        budget.consume_build_chain_call()?;
         build_chain_inner(
             required_eku_if_present,
             supported_sig_algs,
@@ -228,6 +232,7 @@ fn check_signatures(
 
 struct Budget {
     signatures: usize,
+    build_chain_calls: usize,
 }
 
 impl Budget {
@@ -237,6 +242,15 @@ impl Budget {
             .signatures
             .checked_sub(1)
             .ok_or(InternalError::MaximumSignatureChecksExceeded)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn consume_build_chain_call(&mut self) -> Result<(), InternalError> {
+        self.build_chain_calls = self
+            .build_chain_calls
+            .checked_sub(1)
+            .ok_or(InternalError::MaximumPathBuildCallsExceeded)?;
         Ok(())
     }
 }
@@ -249,6 +263,10 @@ impl Default for Budget {
             // being hit in real applications (see <https://github.com/spiffe/spire/issues/1004>).
             // So this may actually be too aggressive.
             signatures: 100,
+
+            // This limit is taken from NSS libmozpkix, see:
+            // <https://github.com/nss-dev/nss/blob/bb4a1d38dd9e92923525ac6b5ed0288479f3f3fc/lib/mozpkix/lib/pkixbuild.cpp#L381-L393>
+            build_chain_calls: 200_000,
         }
     }
 }
@@ -453,17 +471,26 @@ where
     Err(Error::UnknownIssuer.into())
 }
 
+#[cfg(feature="alloc")]
 #[cfg(test)]
 mod tests {
+    use core::convert::TryFrom;
 
-    #[test]
-    #[cfg(feature = "alloc")]
-    fn test_too_many_signatures() {
-        use super::*;
+    use super::*;
+    use crate::verify_cert::{Budget, InternalError};
+
+    enum TrustAnchorIsActualIssuer {
+        Yes,
+        No,
+    }
+
+    fn build_degenerate_chain(
+        intermediate_count: usize,
+        trust_anchor_is_actual_issuer: TrustAnchorIsActualIssuer,
+        budget: Option<Budget>,
+    ) -> ErrorOrInternalError {
         use crate::ECDSA_P256_SHA256;
         use crate::{EndEntityCert, Time};
-        use alloc::{string::ToString, vec::Vec};
-        use core::convert::TryFrom;
 
         let alg = &rcgen::PKCS_ECDSA_P256_SHA256;
 
@@ -485,9 +512,9 @@ mod tests {
         let ca_cert = make_issuer();
         let ca_cert_der = ca_cert.serialize_der().unwrap();
 
-        let mut intermediates = Vec::with_capacity(101);
+        let mut intermediates = Vec::with_capacity(intermediate_count);
         let mut issuer = ca_cert;
-        for _ in 0..101 {
+        for _ in 0..intermediate_count {
             let intermediate = make_issuer();
             let intermediate_der = intermediate.serialize_der_with_signer(&issuer).unwrap();
             intermediates.push(intermediate_der);
@@ -503,26 +530,45 @@ mod tests {
         let anchors = &[TrustAnchor::try_from_cert_der(&ca_cert_der).unwrap()];
         let time = Time::from_seconds_since_unix_epoch(0x1fed_f00d);
         let cert = EndEntityCert::try_from(&ee_cert_der[..]).unwrap();
-        let intermediates_der: Vec<&[u8]> = intermediates.iter().map(|x| x.as_ref()).collect();
-        let intermediate_certs: &[&[u8]] = intermediates_der.as_ref();
+        let mut intermediate_certs = intermediates.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
 
-        // TODO: Use `build_chain` when `Error` is made non-exhaustive.
-        let result = build_chain_inner(
+        if let TrustAnchorIsActualIssuer::No = trust_anchor_is_actual_issuer {
+            intermediate_certs.pop();
+        }
+
+        build_chain_inner(
             EKU_SERVER_AUTH,
             &[&ECDSA_P256_SHA256],
             anchors,
-            intermediate_certs,
+            &intermediate_certs,
             cert.inner(),
             time,
             0,
-            &mut Budget::default(),
-        );
+            &mut budget.unwrap_or_default(),
+        )
+            .unwrap_err()
+    }
 
+    #[test]
+    fn test_too_many_signatures() {
+        assert!(matches!(
+            build_degenerate_chain(5, TrustAnchorIsActualIssuer::Yes, None),
+            ErrorOrInternalError::InternalError(InternalError::MaximumSignatureChecksExceeded),
+        ));
+    }
+
+    #[test]
+    fn test_too_many_path_calls() {
+        let result = build_degenerate_chain(10, TrustAnchorIsActualIssuer::No, Some(Budget {
+            // Crafting a chain that will expend the build chain calls budget without
+            // first expending the signature checks budget is tricky, so we artificially
+            // inflate the signature limit to make this test easier to write.
+            signatures: usize::MAX,
+            ..Budget::default()
+        }));
         assert!(matches!(
             result,
-            Err(ErrorOrInternalError::InternalError(
-                InternalError::MaximumSignatureChecksExceeded
-            ))
+            ErrorOrInternalError::InternalError(InternalError::MaximumPathBuildCallsExceeded),
         ));
     }
 }
