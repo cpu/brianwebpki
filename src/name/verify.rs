@@ -19,6 +19,7 @@ use super::{
 use crate::{
     cert::{Cert, EndEntityOrCa},
     der, Error,
+    verify_cert::{Budget, ErrorOrInternalError},
 };
 
 pub fn verify_cert_dns_name(
@@ -31,7 +32,7 @@ pub fn verify_cert_dns_name(
         cert.subject,
         cert.subject_alt_name,
         Err(Error::CertNotValidForName),
-        &|name| {
+        &mut |name| {
             match name {
                 GeneralName::DnsName(presented_id) => {
                     match dns_name::presented_id_matches_reference_id(presented_id, dns_name) {
@@ -40,7 +41,7 @@ pub fn verify_cert_dns_name(
                         }
                         Some(false) => (),
                         None => {
-                            return NameIteration::Stop(Err(Error::BadDer));
+                            return NameIteration::Stop(Err(ErrorOrInternalError::Error(Error::BadDer)));
                         }
                     }
                 }
@@ -48,14 +49,19 @@ pub fn verify_cert_dns_name(
             }
             NameIteration::KeepGoing
         },
-    )
+    ).map_err(|err| match err {
+        ErrorOrInternalError::Error(err) => err,
+        // Eat internal errors.
+        ErrorOrInternalError::InternalError(_) => Error::UnknownIssuer,
+    })
 }
 
 // https://tools.ietf.org/html/rfc5280#section-4.2.1.10
-pub fn check_name_constraints(
+pub(crate) fn check_name_constraints(
     input: Option<&mut untrusted::Reader>,
     subordinate_certs: &Cert,
-) -> Result<(), Error> {
+    budget: &mut Budget,
+) -> Result<(), ErrorOrInternalError> {
     let input = match input {
         Some(input) => input,
         None => {
@@ -81,8 +87,8 @@ pub fn check_name_constraints(
 
     let mut child = subordinate_certs;
     loop {
-        iterate_names(child.subject, child.subject_alt_name, Ok(()), &|name| {
-            check_presented_id_conforms_to_constraints(name, permitted_subtrees, excluded_subtrees)
+        iterate_names(child.subject, child.subject_alt_name, Ok(()), &mut |name| {
+            check_presented_id_conforms_to_constraints(name, permitted_subtrees, excluded_subtrees, budget)
         })?;
 
         child = match child.ee_or_ca {
@@ -100,11 +106,13 @@ fn check_presented_id_conforms_to_constraints(
     name: GeneralName,
     permitted_subtrees: Option<untrusted::Input>,
     excluded_subtrees: Option<untrusted::Input>,
+    budget: &mut Budget,
 ) -> NameIteration {
     match check_presented_id_conforms_to_constraints_in_subtree(
         name,
         Subtrees::PermittedSubtrees,
         permitted_subtrees,
+        budget,
     ) {
         stop @ NameIteration::Stop(..) => {
             return stop;
@@ -116,6 +124,7 @@ fn check_presented_id_conforms_to_constraints(
         name,
         Subtrees::ExcludedSubtrees,
         excluded_subtrees,
+        budget,
     )
 }
 
@@ -129,6 +138,7 @@ fn check_presented_id_conforms_to_constraints_in_subtree(
     name: GeneralName,
     subtrees: Subtrees,
     constraints: Option<untrusted::Input>,
+    budget: &mut Budget,
 ) -> NameIteration {
     let mut constraints = match constraints {
         Some(constraints) => untrusted::Reader::new(constraints),
@@ -141,6 +151,10 @@ fn check_presented_id_conforms_to_constraints_in_subtree(
     let mut has_permitted_subtrees_mismatch = false;
 
     loop {
+        if let Err(e) = budget.consume_name_constraint_comparison() {
+            return NameIteration::Stop(Err(e.into()));
+        }
+
         // http://tools.ietf.org/html/rfc5280#section-4.2.1.10: "Within this
         // profile, the minimum and maximum fields are not used with any name
         // forms, thus, the minimum MUST be zero, and maximum MUST be absent."
@@ -158,7 +172,7 @@ fn check_presented_id_conforms_to_constraints_in_subtree(
         let base = match general_subtree(&mut constraints) {
             Ok(base) => base,
             Err(err) => {
-                return NameIteration::Stop(Err(err));
+                return NameIteration::Stop(Err(ErrorOrInternalError::Error(err)));
             }
         };
 
@@ -202,13 +216,13 @@ fn check_presented_id_conforms_to_constraints_in_subtree(
             }
 
             (Subtrees::ExcludedSubtrees, Ok(true)) => {
-                return NameIteration::Stop(Err(Error::NameConstraintViolation));
+                return NameIteration::Stop(Err(ErrorOrInternalError::Error(Error::NameConstraintViolation)));
             }
 
             (Subtrees::ExcludedSubtrees, Ok(false)) => (),
 
             (_, Err(err)) => {
-                return NameIteration::Stop(Err(err));
+                return NameIteration::Stop(Err(ErrorOrInternalError::Error(err)));
             }
         }
 
@@ -221,7 +235,7 @@ fn check_presented_id_conforms_to_constraints_in_subtree(
         // If there was any entry of the given type in permittedSubtrees, then
         // it required that at least one of them must match. Since none of them
         // did, we have a failure.
-        NameIteration::Stop(Err(Error::NameConstraintViolation))
+        NameIteration::Stop(Err(ErrorOrInternalError::Error(Error::NameConstraintViolation)))
     } else {
         NameIteration::KeepGoing
     }
@@ -242,15 +256,15 @@ fn presented_directory_name_matches_constraint(
 #[derive(Clone, Copy)]
 enum NameIteration {
     KeepGoing,
-    Stop(Result<(), Error>),
+    Stop(Result<(), ErrorOrInternalError>),
 }
 
 fn iterate_names(
     subject: untrusted::Input,
     subject_alt_name: Option<untrusted::Input>,
     result_if_never_stopped_early: Result<(), Error>,
-    f: &dyn Fn(GeneralName) -> NameIteration,
-) -> Result<(), Error> {
+    f: &mut dyn FnMut(GeneralName) -> NameIteration,
+) -> Result<(), ErrorOrInternalError> {
     match subject_alt_name {
         Some(subject_alt_name) => {
             let mut subject_alt_name = untrusted::Reader::new(subject_alt_name);
@@ -275,7 +289,7 @@ fn iterate_names(
 
     match f(GeneralName::DirectoryName(subject)) {
         NameIteration::Stop(result) => result,
-        NameIteration::KeepGoing => result_if_never_stopped_early,
+        NameIteration::KeepGoing => result_if_never_stopped_early.map_err(|err| ErrorOrInternalError::Error(err)),
     }
 }
 

@@ -49,13 +49,17 @@ pub fn build_chain(
 /// Errors that we cannot report externally since `Error` wasn't declared
 /// non-exhaustive, but which we need to differentiate internally (at least
 /// for testing).
-enum InternalError {
+#[derive(Clone, Copy)]
+pub(crate) enum InternalError {
     MaximumSignatureChecksExceeded,
     /// The maximum number of internal path building calls has been reached. Path complexity is too great.
     MaximumPathBuildCallsExceeded,
+    /// The maximum number of name constraint comparisons has been reached.
+    MaximumNameConstraintComparisonsExceeded
 }
 
-enum ErrorOrInternalError {
+#[derive(Clone, Copy)]
+pub(crate) enum ErrorOrInternalError {
     Error(Error),
     InternalError(InternalError),
 }
@@ -65,7 +69,8 @@ impl ErrorOrInternalError {
         match self {
             ErrorOrInternalError::Error(_) => false,
             ErrorOrInternalError::InternalError(InternalError::MaximumSignatureChecksExceeded) |
-            ErrorOrInternalError::InternalError(InternalError::MaximumPathBuildCallsExceeded) => {
+            ErrorOrInternalError::InternalError(InternalError::MaximumPathBuildCallsExceeded) |
+            ErrorOrInternalError::InternalError(InternalError::MaximumNameConstraintComparisonsExceeded) => {
                 true
             }
         }
@@ -128,8 +133,8 @@ fn build_chain_inner(
 
         let name_constraints = trust_anchor.name_constraints.map(untrusted::Input::from);
 
-        untrusted::read_all_optional(name_constraints, Error::BadDer, |value| {
-            name::check_name_constraints(value, cert)
+        untrusted::read_all_optional(name_constraints, ErrorOrInternalError::Error(Error::BadDer), |value| {
+            name::check_name_constraints(value, cert, budget)
         })?;
 
         // TODO: check_distrust(trust_anchor_subject, trust_anchor_spki)?;
@@ -177,8 +182,8 @@ fn build_chain_inner(
             }
         }
 
-        untrusted::read_all_optional(potential_issuer.name_constraints, Error::BadDer, |value| {
-            name::check_name_constraints(value, cert)
+        untrusted::read_all_optional(potential_issuer.name_constraints, ErrorOrInternalError::Error(Error::BadDer), |value| {
+            name::check_name_constraints(value, cert, budget)
         })?;
 
         let next_sub_ca_count = match used_as_ca {
@@ -228,9 +233,10 @@ fn check_signatures(
     Ok(())
 }
 
-struct Budget {
+pub(crate) struct Budget {
     signatures: usize,
     build_chain_calls: usize,
+    name_constraint_comparisons: usize,
 }
 
 impl Budget {
@@ -251,6 +257,15 @@ impl Budget {
             .ok_or(InternalError::MaximumPathBuildCallsExceeded.into())?;
         Ok(())
     }
+
+    #[inline]
+    pub(crate) fn consume_name_constraint_comparison(&mut self) -> Result<(), InternalError> {
+        self.name_constraint_comparisons = self
+            .name_constraint_comparisons
+            .checked_sub(1)
+            .ok_or(InternalError::MaximumNameConstraintComparisonsExceeded.into())?;
+        Ok(())
+    }
 }
 
 impl Default for Budget {
@@ -265,6 +280,10 @@ impl Default for Budget {
             // This limit is taken from NSS libmozpkix, see:
             // <https://github.com/nss-dev/nss/blob/bb4a1d38dd9e92923525ac6b5ed0288479f3f3fc/lib/mozpkix/lib/pkixbuild.cpp#L381-L393>
             build_chain_calls: 200_000,
+
+            // This limit is taken from golang crypto/x509's default, see:
+            // <https://github.com/golang/go/blob/ac17bb6f13979f2ab9fcd45f0758b43ed72d0973/src/crypto/x509/verify.go#L588-L592>
+            name_constraint_comparisons: 250_000,
         }
     }
 }
